@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Publisher</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 16px; }
+    video { width: 480px; max-width: 90vw; background:#000; display:block; margin-top:8px; }
+    .row { margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>Publisher</h1>
+  <p>Select a local <b>side-by-side (SBS)</b> video, then click <b>Start Publish</b>.</p>
+
+  <div class="row">
+    Room ID:
+    <input id="roomId" value="demo" />
+  </div>
+
+  <div class="row">
+    <input type="file" id="fileInput" accept="video/*" />
+    <button id="startBtn" disabled>Start Publish</button>
+  </div>
+
+  <!-- Local preview of the video being streamed -->
+  <video id="video" playsinline controls></video>
+
+  <!-- Status message -->
+  <div id="status" style="margin-top:10px; color: green; font-weight:bold;"></div>
+
+  <!-- Socket.IO for signaling -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <!-- App logic -->
+  <script src="./main.js"></script>
+</body>
+</html>

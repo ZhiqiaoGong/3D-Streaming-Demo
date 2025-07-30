@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Receiver (WebXR Stereo)</title>
+  <style>
+    body { margin:0; overflow:hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #ui {
+      position:fixed; top:8px; left:8px;
+      background:rgba(0,0,0,0.55); color:#fff;
+      padding:8px 10px; border-radius:10px; z-index:10;
+      display:flex; flex-direction:column; gap:6px;
+    }
+    #ui .row { display:flex; align-items:center; gap:6px; }
+    #status { font-weight:600; }
+    video { display:none; } /* used only as a texture source when debug.showVideo(true) */
+
+    /* Keep Three.js VR button visible when XR is enabled (hidden automatically in Debug mode) */
+    #VRButton, .vr-button {
+      position: fixed !important;
+      right: 10px !important;
+      bottom: 10px !important;
+      z-index: 9999 !important;
+    }
+  </style>
+  <!-- Avoid favicon 404 noise -->
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <div id="ui">
+    <div class="row">
+      Room: <input id="roomId" value="demo" />
+      <button id="joinBtn">Join</button>
+      <button id="enterXRBtn">Enter XR</button>
+      <button id="debugBtn">Toggle Debug (No XR)</button>
+    </div>
+    <div id="status">Idle. Ready to join.</div>
+  </div>
+
+  <!-- Hidden <video> to receive the remote MediaStream -->
+  <video id="remoteVideo" playsinline></video>
+
+  <!-- Socket.IO for signaling -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <!-- Three.js core (global THREE) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>
+  <!-- App logic (ES module) -->
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
