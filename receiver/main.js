@@ -1,13 +1,19 @@
-// Receiver (final, with split layout in Debug):
-// - WebRTC receive, event-driven video metadata -> build stereo planes
-// - Debug mode: side-by-side planes (no XR), easy to see both eyes
-// - XR mode: overlapped planes, per-eye layers
-// - Runtime console helpers exposed via window.debug
+// Receiver with:
+// - WebRTC auto-reconnect (waits for network to come back before rejoining)
+// - Debug mode: side-by-side preview with "contain" auto-fit (UNCHANGED SIZE)
+// - XR mode: overlapped planes with per-eye layers and "contain" fit
+//   (XR size tuned to be larger but never cropped)
+// - Layout is recomputed on XR session start/end to handle XR FOV/aspect changes
 
 import { VRButton } from 'https://cdn.jsdelivr.net/npm/three@0.155.0/examples/jsm/webxr/VRButton.js';
 
+
+const XR_WIDTH_FILL  = 0.98; // portion of visible width to occupy in XR (0.98 = 98%)
+const XR_HEIGHT_FILL = 0.98; // max portion of visible height in XR
+
+// Signaling
 const SIGNALING_URL = 'http://localhost:3000';
-const socket = io(SIGNALING_URL);
+const socket = io(SIGNALING_URL, { autoConnect: true });
 
 // DOM
 const roomIdInput = document.getElementById('roomId');
@@ -17,19 +23,20 @@ const debugBtn    = document.getElementById('debugBtn');
 const remoteVideo = document.getElementById('remoteVideo');
 const statusDiv   = document.getElementById('status');
 
-// WebRTC
-const pc = new RTCPeerConnection({ iceServers: [] });
-
-// Three / XR state
+// Three/XR state 
 let renderer, scene, camera;
 let videoTexture, leftMesh, rightMesh;
 let leftMat, rightMat;
-let debugMode = false;          // true => normal canvas, side-by-side
 let threeInitialized = false;
 let planesBuilt = false;
-let planeSize = { width: 0, height: 0 }; // meters
+let debugMode = false;                   // Debug = true → side-by-side preview, no XR
+let planeSize = { width: 0, height: 0 }; // unscaled plane size in meters
 
-// ---------- status ----------
+// WebRTC state 
+let roomId = 'demo';
+let pc = null;
+
+// UI helpers 
 function setStatus(msg, color = 'white') {
   statusDiv.textContent = msg;
   statusDiv.style.color = color;
@@ -43,28 +50,51 @@ function showVRButton(show) {
   if (el) el.style.display = show ? 'block' : 'none';
 }
 
-// ---------- Three.js ----------
+// Network helper 
+function waitForOnline() {
+  return new Promise((resolve) => {
+    if (navigator.onLine) return resolve();
+    console.log('[Receiver] Waiting for network...');
+    window.addEventListener('online', () => {
+      console.log('[Receiver] Network is back.');
+      resolve();
+    }, { once: true });
+  });
+}
+
+// FOV/frustum helpers 
+function getCameraFovDeg(cam) {
+  if (typeof cam.fov === 'number') return cam.fov;
+  const m = cam.projectionMatrix?.elements;
+  if (!m) return 70;
+  const f = m[5];
+  const fovRad = 2 * Math.atan(1 / f);
+  return THREE.MathUtils.radToDeg(fovRad);
+}
+function visibleSizeAtZ(cam, zAbs) {
+  const fovDeg = getCameraFovDeg(cam);
+  const fovRad = THREE.MathUtils.degToRad(fovDeg);
+  const visH   = 2 * zAbs * Math.tan(fovRad / 2);
+  const visW   = visH * (cam.aspect || (window.innerWidth / window.innerHeight));
+  return { visW, visH };
+}
+
+// Three setup 
 function setupThree() {
   if (threeInitialized) return;
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
-
-  // XR only when NOT in debug
   renderer.xr.enabled = !debugMode;
 
-  // Canvas first
   document.body.appendChild(renderer.domElement);
 
-  // VR button only in XR mode
   if (!debugMode) {
     document.body.appendChild(VRButton.createButton(renderer));
     showVRButton(true);
-    console.log('[Receiver] VRButton appended (XR enabled).');
   } else {
     showVRButton(false);
-    console.log('[Receiver] XR disabled (Debug mode).');
   }
 
   scene = new THREE.Scene();
@@ -76,43 +106,59 @@ function setupThree() {
   const light = new THREE.AmbientLight(0xffffff, 1.0);
   scene.add(light);
 
+  // Re-fit while in non‑XR (XR uses its own cameras)
   window.addEventListener('resize', () => {
     if (!renderer.xr.isPresenting) {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      applyLayoutForMode();
     }
   });
 
+  // XR session start/end → recompute layout for XR/Screen cameras
+  renderer.xr.addEventListener('sessionstart', () => {
+    const xrCam = renderer.xr.getCamera(camera);
+    if (xrCam.cameras && xrCam.cameras.length === 2) {
+      const camLeft  = xrCam.cameras[0];
+      const camRight = xrCam.cameras[1];
+      camLeft.layers.enable(1);  camLeft.layers.disable(2);
+      camRight.layers.enable(2); camRight.layers.disable(1);
+    }
+    applyLayoutForMode();
+  });
+  renderer.xr.addEventListener('sessionend', () => {
+    applyLayoutForMode();
+  });
+
   threeInitialized = true;
-  expose(); // make objects available to console
+  expose(); // console helpers
 }
 
+// Build stereo planes 
 function buildStereoPlanesWithCurrentVideoSize() {
   if (planesBuilt) return;
 
   const vw = remoteVideo.videoWidth;
   const vh = remoteVideo.videoHeight;
   if (!vw || !vh) {
-    console.error('[Receiver] Cannot build planes: invalid video size', { vw, vh });
+    console.error('[Receiver] Invalid video size', { vw, vh });
     return;
   }
-  console.log(`[Receiver] Video metadata ready. width=${vw}, height=${vh}`);
 
   videoTexture = new THREE.VideoTexture(remoteVideo);
   videoTexture.minFilter = THREE.LinearFilter;
   videoTexture.magFilter = THREE.LinearFilter;
   videoTexture.generateMipmaps = false;
 
-  // SBS aspect: (vw/2)/vh
-  const aspect = (vw / 2) / vh;
-  const heightM = 1.5;            // start comfortably large
+  // Half width per eye for SBS
+  const aspect  = (vw / 2) / vh;
+  const heightM = 1.5;               // base size (scaled by layout)
   const widthM  = aspect * heightM;
   planeSize = { width: widthM, height: heightM };
 
   const geo = new THREE.PlaneGeometry(widthM, heightM);
 
-  // Materials sample each half of the SBS texture
   leftMat  = new THREE.MeshBasicMaterial({ map: videoTexture });
   leftMat.map.repeat.set(0.5, 1.0);
   leftMat.map.offset.set(0.0, 0.0);
@@ -123,37 +169,20 @@ function buildStereoPlanesWithCurrentVideoSize() {
 
   leftMesh  = new THREE.Mesh(geo, leftMat);
   rightMesh = new THREE.Mesh(geo, rightMat);
+  scene.add(leftMesh); scene.add(rightMesh);
 
-  // Default positions will be finalized by layout function
-  scene.add(leftMesh);
-  scene.add(rightMesh);
-
-  // Layers for XR (per-eye)
+  // Per‑eye layers (XR)
   leftMesh.layers.set(1);
   rightMesh.layers.set(2);
 
-  // Per-eye layer routing for XR cameras
-  renderer.xr.addEventListener('sessionstart', () => {
-    const xrCam = renderer.xr.getCamera(camera);
-    if (xrCam.cameras && xrCam.cameras.length === 2) {
-      const camLeft  = xrCam.cameras[0];
-      const camRight = xrCam.cameras[1];
-      camLeft.layers.enable(1);  camLeft.layers.disable(2);
-      camRight.layers.enable(2); camRight.layers.disable(1);
-    }
-  });
-
-  // Apply layout for current mode (split vs overlapped)
   applyLayoutForMode();
 
-  // Render loop
+  // Render loop (uses XR frame loop when in XR)
   renderer.setAnimationLoop(() => {
     if (debugMode) {
-      // Normal camera renders both halves in Debug
       camera.layers.enableAll();
       if (videoTexture) videoTexture.needsUpdate = true;
     } else {
-      // Normal camera neutral; XR sub-cameras do the per-eye work
       camera.layers.disable(1);
       camera.layers.disable(2);
     }
@@ -164,56 +193,96 @@ function buildStereoPlanesWithCurrentVideoSize() {
   expose();
 }
 
-// Split (Debug) vs Overlapped (XR) layout
+// Layout 
 function applyLayoutForMode() {
-    if (!leftMesh || !rightMesh) return;
-  
-    const y = camera ? camera.position.y : 1.6;
-    const z = -1.0;
-  
-    if (debugMode) {
-      // Debug mode: side-by-side planes
-      leftMesh.scale.set(1, 1, 1);
-      rightMesh.scale.set(1, 1, 1);
-  
-      // Set positions for side-by-side layout
-      const halfW = planeSize.width;
-      const gap = 0; // no gap in debug mode
-      leftMesh.position.set(-planeSize.width / 2, y, z);
-      rightMesh.position.set(planeSize.width / 2, y, z);
-  
-    } else {
-      // XR Mode: overlapped planes
-      leftMesh.position.set(0, y, z);
-      rightMesh.position.set(0, y, z);
-    }
-  }
-  
-  
+  if (!leftMesh || !rightMesh) return;
 
-// ---------- WebRTC ----------
-async function joinAndAnswer(roomId) {
-  setStatus(`Joining room "${roomId}"...`, 'deepskyblue');
-  socket.emit('join', roomId, 'receiver');
+  // XR has priority: if in XR, we always use the XR branch regardless of debugMode
+  const inXR = !!(renderer && renderer.xr && renderer.xr.isPresenting);
+  const useDebugLayout = !inXR && debugMode;
+
+  const y    = camera ? camera.position.y : 1.6;
+  const z    = -0.7;         // negative Z (forward in camera space)
+  const zAbs = Math.abs(z);
+
+  const srcW = planeSize.width;
+  const srcH = planeSize.height;
+  const srcAspect = srcW / srcH;
+
+  if (useDebugLayout) {
+    // ---------- DEBUG: side-by-side, contain-fit ----------
+    const { visW, visH } = visibleSizeAtZ(camera, zAbs);
+
+    const pairW      = visW * 0.95;
+    const singleW    = pairW / 2;
+    let   singleH    = singleW / srcAspect;
+    const maxSingleH = visH * 0.95;
+
+    let scaleX = singleW / srcW;
+    let scaleY = singleH / srcH;
+    if (singleH > maxSingleH) {
+      const k = maxSingleH / singleH;
+      scaleX *= k; scaleY *= k; singleH *= k;
+    }
+
+    leftMesh.scale.set(scaleX, scaleY, 1);
+    rightMesh.scale.set(scaleX, scaleY, 1);
+
+    leftMesh.position.set(-singleW / 2, y, z);
+    rightMesh.position.set( singleW / 2, y, z);
+
+  } else {
+    // ---------- XR: overlapped, contain-fit with larger fill but never cropped ----------
+    let camForSizing = camera;
+    if (inXR) {
+      const xrCam = renderer.xr.getCamera(camera);
+      camForSizing = (xrCam.cameras && xrCam.cameras.length > 0) ? xrCam.cameras[0] : xrCam;
+    }
+
+    const { visW, visH } = visibleSizeAtZ(camForSizing, zAbs);
+
+    // Larger but safe: fill most of the visible width, limited by visible height.
+    const targetW = visW * XR_WIDTH_FILL;
+    let   targetH = targetW / srcAspect;
+
+    const maxH    = visH * XR_HEIGHT_FILL;
+
+    let scaleX = targetW / srcW;
+    let scaleY = targetH / srcH;
+    if (targetH > maxH) {
+      const k = maxH / targetH; // shrink uniformly to fit height
+      scaleX *= k; scaleY *= k; targetH *= k;
+    }
+
+    leftMesh.scale.set(scaleX, scaleY, 1);
+    rightMesh.scale.set(scaleX, scaleY, 1);
+
+    // Overlapped at the same position; XR per-eye layers decide visibility
+    leftMesh.position.set(0, y, z);
+    rightMesh.position.set(0, y, z);
+  }
+}
+
+// WebRTC (auto‑reconnect) 
+function createPeer() {
+  if (pc) { try { pc.close(); } catch {} }
+  pc = new RTCPeerConnection({ iceServers: [] });
 
   pc.ontrack = (e) => {
-    console.log('[Receiver] ontrack fired');
     const [stream] = e.streams;
     remoteVideo.srcObject = stream;
 
     const onMeta = () => {
       remoteVideo.removeEventListener('loadedmetadata', onMeta);
       remoteVideo.removeEventListener('loadeddata', onMeta);
-      console.log('[Receiver] onloadedmetadata/loadeddata fired.');
-      remoteVideo.style.display = 'none'; // hide raw <video> by default
+      remoteVideo.style.display = 'none';
       if (!threeInitialized) setupThree();
       buildStereoPlanesWithCurrentVideoSize();
       remoteVideo.play().catch(() => {});
     };
 
-    if (remoteVideo.videoWidth && remoteVideo.videoHeight) {
-      onMeta();
-    } else {
+    if (remoteVideo.videoWidth && remoteVideo.videoHeight) onMeta();
+    else {
       remoteVideo.addEventListener('loadedmetadata', onMeta, { once: true });
       remoteVideo.addEventListener('loadeddata', onMeta, { once: true });
     }
@@ -227,41 +296,59 @@ async function joinAndAnswer(roomId) {
 
   pc.onconnectionstatechange = () => {
     console.log('[Receiver] PC state:', pc.connectionState);
+
     if (pc.connectionState === 'connected') {
       setStatus('✅ Peer connection established.', 'lightgreen');
-    } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-      setStatus(`⚠️ Connection state: ${pc.connectionState}`, 'orange');
+      return;
+    }
+
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      setStatus(`Connection ${pc.connectionState}. Rejoining...`, 'orange');
+
+      // Dispose current pc and wait until we are back online, then rejoin.
+      try { pc.close(); } catch {}
+      pc = null;
+
+      waitForOnline().then(() => {
+        setStatus('Network back. Rejoining...', 'deepskyblue');
+        setTimeout(() => {
+          socket.emit('join', roomId, 'receiver'); // server will request a fresh offer from publisher
+          setStatus('Waiting for new offer from publisher...', 'deepskyblue');
+        }, 800);
+      });
     }
   };
+}
 
+async function joinAndAnswer(rid) {
+  roomId = rid;
+  setStatus(`Joining room "${roomId}"...`, 'deepskyblue');
+
+  createPeer();
+  socket.emit('join', roomId, 'receiver');
+
+  // Avoid duplicate handlers across re-joins
+  socket.off('offer');
   socket.on('offer', async ({ sdp }) => {
     console.log('[Receiver] Offer received');
-    setStatus('Offer received. Creating answer...', 'deepskyblue');
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     socket.emit('answer', { roomId, sdp: answer });
-    console.log('[Receiver] Answer sent.');
     setStatus('✅ Answer sent. Waiting for media...', 'lightgreen');
   });
 
+  socket.off('ice-candidate');
   socket.on('ice-candidate', async ({ candidate }) => {
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      console.log('[Receiver] Remote ICE added');
-    } catch (e) {
-      console.error('[Receiver] Error adding ICE candidate', e);
-      setStatus('Error adding ICE candidate. See console.', 'orange');
-    }
+    try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); }
+    catch (e) { console.error('[Receiver] addIceCandidate error', e); }
   });
-
-  pc.addTransceiver('video', { direction: 'recvonly' });
 }
 
-// ---------- UI ----------
+// UI 
 joinBtn.addEventListener('click', async () => {
-  const roomId = (roomIdInput.value || '').trim() || 'demo';
-  await joinAndAnswer(roomId);
+  const rid = (roomIdInput.value || '').trim() || 'demo';
+  await joinAndAnswer(rid);
   setStatus('Waiting for offer from publisher...', 'deepskyblue');
 });
 
@@ -273,86 +360,54 @@ enterXRBtn.addEventListener('click', async () => {
   if (!threeInitialized) setupThree();
   const btn = getVRButtonEl();
   if (btn) btn.click();
+  // Some emulators need a small delay before XR cameras are active
+  setTimeout(() => applyLayoutForMode(), 200);
 });
 
 debugBtn.addEventListener('click', async () => {
   debugMode = !debugMode;
   setStatus(debugMode ? 'Debug mode ON (no XR).' : 'Debug mode OFF. XR enabled if available.', debugMode ? 'khaki' : 'white');
 
-  // End XR session if any, then reconfigure renderer
   if (renderer && renderer.xr && renderer.xr.getSession()) {
     try { await renderer.xr.getSession().end(); } catch {}
   }
+  if (!threeInitialized) setupThree();
 
-  if (!threeInitialized) {
-    setupThree();
-  } else {
-    renderer.xr.enabled = !debugMode;
-    showVRButton(!debugMode);
-    applyLayoutForMode(); // re-layout planes for current mode
-  }
+  renderer.xr.enabled = !debugMode;
+  showVRButton(!debugMode);
+  applyLayoutForMode();
 
-  // Optional: show raw <video> in debug for quick verification (toggle from console)
-  remoteVideo.style.display = debugMode ? 'none' : 'none';
-
-  // If stream is ready but planes not built (rare), build now
   if (!planesBuilt && remoteVideo.srcObject && remoteVideo.videoWidth && remoteVideo.videoHeight) {
     buildStereoPlanesWithCurrentVideoSize();
   }
-
-  expose();
 });
 
-// Socket status
-socket.on('connect', () => setStatus('Signaling connected. Ready to join.', 'deepskyblue'));
+// Socket auto-rejoin 
+socket.on('connect', () => {
+  setStatus('Signaling connected. Ready.', 'deepskyblue');
+  if (roomId) socket.emit('join', roomId, 'receiver'); // auto re-join last room on reconnect
+});
 socket.on('disconnect', () => setStatus('Signaling disconnected.', 'orange'));
 
-// ---------- Runtime console helpers ----------
+// Console helpers 
 function expose() {
   window.debug = {
-    // raw objects
-    scene, camera, leftMesh, rightMesh, remoteVideo, videoTexture, renderer, leftMat, rightMat,
-    // info dump
+    scene, camera, leftMesh, rightMesh, remoteVideo, videoTexture,
     info() {
       const vw = remoteVideo?.videoWidth, vh = remoteVideo?.videoHeight;
-      const cam = camera ? { x: camera.position.x, y: camera.position.y, z: camera.position.z } : null;
-      const lm  = leftMesh  ? { x: leftMesh.position.x,  y: leftMesh.position.y,  z: leftMesh.position.z }  : null;
-      const rm  = rightMesh ? { x: rightMesh.position.x, y: rightMesh.position.y, z: rightMesh.position.z } : null;
-      console.table({ videoWidth: vw, videoHeight: vh, planeWidthM: planeSize.width, planeHeightM: planeSize.height, camera: JSON.stringify(cam), leftMesh: JSON.stringify(lm), rightMesh: JSON.stringify(rm), debugMode });
+      console.table({
+        videoWidth: vw, videoHeight: vh,
+        planeWidthM: planeSize.width, planeHeightM: planeSize.height,
+        debugMode,
+        leftPos: leftMesh?.position, rightPos: rightMesh?.position
+      });
     },
-    // move both
-    setPlanePos(x=0, y=1.6, z=-1) {
-      if (leftMesh && rightMesh) {
-        leftMesh.position.set(x,y,z);
-        rightMesh.position.set(x,y,z);
-      }
-    },
-    // move individually (to verify which is which)
-    setLeftPos(x=0, y=1.6, z=-1)  { if (leftMesh)  leftMesh.position.set(x,y,z);  },
-    setRightPos(x=0, y=1.6, z=-1) { if (rightMesh) rightMesh.position.set(x,y,z); },
-    // scale
-    setPlaneScale(sx=1, sy=1) {
-      if (leftMesh && rightMesh) {
-        leftMesh.scale.set(sx, sy, 1);
-        rightMesh.scale.set(sx, sy, 1);
-      }
-    },
-    // tint materials to distinguish (red = left, green = right)
     tint(on=true) {
-      if (!leftMat || !rightMat) return;
-      leftMat.color.set(on ? 0xff6666 : 0xffffff);
-      rightMat.color.set(on ? 0x66ff66 : 0xffffff);
-    },
-    // toggle split/overlap manually
-    separate() { debugMode = true; if (renderer) { renderer.xr.enabled = false; showVRButton(false); } applyLayoutForMode(); },
-    overlap()  { debugMode = false; if (renderer) { renderer.xr.enabled = true;  showVRButton(true);  } applyLayoutForMode(); },
-    // raw <video> visibility
-    showVideo(show=true) {
-      remoteVideo.style.display = show ? 'block' : 'none';
-      if (show) { remoteVideo.style.position='fixed'; remoteVideo.style.right='10px'; remoteVideo.style.bottom='10px'; remoteVideo.style.width='320px'; remoteVideo.style.zIndex='9999'; }
-    },
-    layersAll()   { if (camera) camera.layers.enableAll(); },
-    forceUpdate() { if (videoTexture) videoTexture.needsUpdate = true; }
+      if (leftMat && rightMat) {
+        leftMat.color.set(on ? 0xff6666 : 0xffffff);
+        rightMat.color.set(on ? 0x6666ff : 0xffffff);
+      }
+    }
   };
-  console.log('%cRuntime helpers available as "debug"', 'color:#0f0');
+  console.log('%cUse "debug.info()" and "debug.tint()" in console.', 'color:#0f0');
 }

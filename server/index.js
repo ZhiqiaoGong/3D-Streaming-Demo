@@ -1,55 +1,92 @@
-// Minimal signaling server using Express + Socket.IO.
-// It only relays SDP offers/answers and ICE candidates between peers in the same room.
+// Minimal Socket.IO signaling server with room/role tracking.
+// - Tracks which socket is the publisher in each room
+// - When a receiver joins (or rejoins), asks the publisher to (re)send an offer
+// - Relays offer/answer/ICE between peers in the same room
+//
+// Usage:
+//   node index.js
+//   => http://localhost:3000
 
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
-
-const app = express();
-app.use(cors()); // Allow dev-time cross-origin requests from local file servers.
-
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' }
-});
-
-// Each WebSocket connection can "join" a logical room (string roomId).
-io.on('connection', (socket) => {
-  // Client tells us which room it wants to join and its role (publisher/receiver).
-  socket.on('join', (roomId, role) => {
-    socket.join(roomId);
-    socket.data = { roomId, role };
-    // Notify the other peer in the same room that someone joined (optional, for debugging/UI).
-    socket.to(roomId).emit('peer-joined', role);
-  });
-
-  // Publisher sends an SDP offer; we forward it to the other peer in the room.
-  socket.on('offer', ({ roomId, sdp }) => {
-    socket.to(roomId).emit('offer', { sdp });
-  });
-
-  // Receiver sends an SDP answer; we forward it to the publisher.
-  socket.on('answer', ({ roomId, sdp }) => {
-    socket.to(roomId).emit('answer', { sdp });
-  });
-
-  // Both peers exchange ICE candidates through the server.
-  socket.on('ice-candidate', ({ roomId, candidate }) => {
-    socket.to(roomId).emit('ice-candidate', { candidate });
-  });
-
-  // Inform the room the peer has left (optional).
-  socket.on('disconnect', () => {
-    const roomId = socket?.data?.roomId;
-    if (roomId) socket.to(roomId).emit('peer-left');
-  });
-});
-
-// Simple liveness endpoint.
-app.get('/', (_, res) => res.send('Signaling server is running'));
 
 const PORT = 3000;
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+// rooms[roomId] = { publisher: <socketId|null>, receivers: Set<socketId> }
+const rooms = {};
+
+io.on('connection', (socket) => {
+  console.log('Socket connected:', socket.id);
+
+  socket.on('join', (roomId, role) => {
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+    socket.data.role = role;
+
+    if (!rooms[roomId]) {
+      rooms[roomId] = { publisher: null, receivers: new Set() };
+    }
+
+    if (role === 'publisher') {
+      rooms[roomId].publisher = socket.id;
+      console.log(`[room:${roomId}] publisher joined: ${socket.id}`);
+      socket.to(roomId).emit('publisher-joined');
+    } else {
+      rooms[roomId].receivers.add(socket.id);
+      console.log(`[room:${roomId}] receiver joined: ${socket.id}`);
+
+      const pubId = rooms[roomId].publisher;
+      if (pubId) {
+        // Ask the publisher to (re)negotiate for this room.
+        io.to(pubId).emit('request-offer', { roomId, receiverId: socket.id });
+      }
+    }
+  });
+
+  socket.on('offer', (payload) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+    socket.to(roomId).emit('offer', payload);
+  });
+
+  socket.on('answer', (payload) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+    socket.to(roomId).emit('answer', payload);
+  });
+
+  socket.on('ice-candidate', (payload) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+    socket.to(roomId).emit('ice-candidate', payload);
+  });
+
+  socket.on('disconnect', () => {
+    const { roomId, role } = socket.data || {};
+    console.log('Socket disconnected:', socket.id, roomId, role);
+
+    if (roomId && rooms[roomId]) {
+      if (role === 'publisher' && rooms[roomId].publisher === socket.id) {
+        rooms[roomId].publisher = null;
+        socket.to(roomId).emit('publisher-left');
+      } else if (role === 'receiver') {
+        rooms[roomId].receivers.delete(socket.id);
+        socket.to(roomId).emit('receiver-left', { receiverId: socket.id });
+      }
+
+      // Optional cleanup
+      if (!rooms[roomId].publisher && rooms[roomId].receivers.size === 0) {
+        delete rooms[roomId];
+      }
+    }
+  });
+});
+
 server.listen(PORT, () => {
-  console.log(`Signaling server: http://localhost:${PORT}`);
+  console.log(`Signaling server listening at http://localhost:${PORT}`);
 });

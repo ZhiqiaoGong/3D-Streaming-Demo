@@ -1,150 +1,144 @@
-// Browser-side Publisher logic.
-// - Loads a local SBS video file into a <video> element.
-// - Uses HTMLVideoElement.captureStream() to obtain a MediaStream.
-// - Creates a WebRTC RTCPeerConnection and sends the video track(s) to the Receiver.
-// - Signaling (offer/answer/ICE) is relayed via the Socket.IO server.
+// Publisher with auto-reconnect and looped local video.
+// - User selects a local SBS file
+// - We capture a MediaStream from <video> and publish via WebRTC
+// - On receiver rejoin or socket reconnect, we re-offer automatically
+// - On network loss, we wait until back online before re-negotiating
 
-const SIGNALING_URL = 'http://localhost:3000'; // Change to LAN IP if testing across devices.
-const socket = io(SIGNALING_URL);
+const SIGNALING_URL = 'http://localhost:3000';
+const socket = io(SIGNALING_URL, { autoConnect: true });
 
-// For local/LAN demos, STUN/TURN servers are often unnecessary.
-// If test across NATs, uncomment the STUN server below.
-// const pc = new RTCPeerConnection({
-//   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-// });
-const pc = new RTCPeerConnection({ iceServers: [] });
-
-// DOM elements
 const fileInput = document.getElementById('fileInput');
-const startBtn = document.getElementById('startBtn');
-const roomIdInput = document.getElementById('roomId');
-const videoEl = document.getElementById('video');
-const statusDiv = document.getElementById('status'); // <div id="status"></div> in HTML
+const startBtn  = document.getElementById('startBtn');
+const roomInput = document.getElementById('roomId');
+const videoEl   = document.getElementById('video');
+const statusEl  = document.getElementById('status');
 
-// State
 let roomId = 'demo';
-let lastOffer = null;
-let started = false;
+let pc = null;
+let localStream = null;
+let started = false;        // true after user selected a file and clicked Start
+let pendingNegotiate = false;
 
-// Helpers
-function setStatus(msg, color = 'green') {
-  if (!statusDiv) return;
-  statusDiv.innerText = msg;
-  statusDiv.style.color = color;
-  // Also log for debugging
+function setStatus(msg, color = 'black') {
+  statusEl.textContent = msg;
+  statusEl.style.color = color;
   console.log('[Publisher][STATUS]', msg);
 }
 
-// Enable the start button after a video file is selected and metadata is known.
-fileInput.addEventListener('change', () => {
-  const file = fileInput.files?.[0];
-  if (!file) return;
-  const url = URL.createObjectURL(file);
-  videoEl.src = url;
+function waitForOnline() {
+  return new Promise((resolve) => {
+    if (navigator.onLine) return resolve();
+    console.log('[Publisher] Waiting for network...');
+    window.addEventListener('online', () => {
+      console.log('[Publisher] Network is back.');
+      resolve();
+    }, { once: true });
+  });
+}
 
+// Enable Start when a file is chosen
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files?.[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  videoEl.src = url;
+  videoEl.loop = true; // loop for demo stability
   videoEl.onloadedmetadata = () => {
     startBtn.disabled = false;
-    setStatus('Video loaded. Ready to publish...', 'blue');
+    setStatus('Video selected. Ready to publish.');
   };
 });
 
-// Main click handler to start publishing
 startBtn.addEventListener('click', async () => {
-  if (started) {
-    setStatus('Already publishing. If you need to restart, refresh the page.', 'blue');
+  roomId = (roomInput.value || '').trim() || 'demo';
+  socket.emit('join', roomId, 'publisher');
+  setStatus(`Joining room "${roomId}" as publisher...`, 'deepskyblue');
+
+  try { await videoEl.play(); } catch {}
+
+  localStream =
+    videoEl.captureStream ? videoEl.captureStream() :
+    videoEl.mozCaptureStream ? videoEl.mozCaptureStream() : null;
+
+  if (!localStream) {
+    setStatus('captureStream() not available in this browser.', 'crimson');
+    alert('Use a modern Chromium/Firefox browser.');
     return;
   }
+  started = true;
 
-  try {
-    roomId = (roomIdInput.value || '').trim() || 'demo';
-    setStatus(`Joining room "${roomId}"...`, 'blue');
-    socket.emit('join', roomId, 'publisher');
-
-    // Some browsers require user gesture to play.
-    setStatus('Attempting to play the selected video...', 'blue');
-    await videoEl.play();
-
-    // Capture a MediaStream from the <video>.
-    const stream =
-      videoEl.captureStream ? videoEl.captureStream() :
-      videoEl.mozCaptureStream ? videoEl.mozCaptureStream() : null;
-
-    if (!stream) {
-      setStatus('captureStream() is unavailable. Please use a modern Chromium-based browser.', 'red');
-      alert('captureStream() is unavailable in this browser. Please use a modern Chromium-based browser.');
-      return;
-    }
-
-    // Add tracks to the PeerConnection
-    for (const track of stream.getTracks()) {
-      pc.addTrack(track, stream);
-    }
-
-    // Forward local ICE candidates to the remote peer via the signaling server.
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        socket.emit('ice-candidate', { roomId, candidate: e.candidate });
-      }
-    };
-
-    // Create and send the SDP offer
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    lastOffer = offer;
-    socket.emit('offer', { roomId, sdp: offer });
-    console.log('[Publisher] Offer sent.');
-    setStatus('✅ Publishing started. Waiting for receiver to join...', 'green');
-
-    started = true;
-  } catch (err) {
-    console.error('[Publisher] Failed to start publishing:', err);
-    setStatus(`❌ Failed to start publishing: ${err?.message || err}`, 'red');
-    alert('Failed to start publishing. See console for details.');
-  }
+  await waitForOnline();
+  await createPeerAndNegotiate();
 });
 
-// Late-join handling: if a receiver joins after we already sent an offer,
-// re-send the last offer so they can answer.
-socket.on('peer-joined', (role) => {
-  console.log('[Publisher] peer-joined:', role);
-  if (role === 'receiver' && lastOffer) {
-    socket.emit('offer', { roomId, sdp: lastOffer });
-    setStatus('📡 Receiver joined. Re-sent offer.', 'blue');
-  }
-});
+async function createPeerAndNegotiate() {
+  if (!navigator.onLine) await waitForOnline();
 
-// When the Receiver responds with an SDP answer, set it as the remote description.
+  // Dispose old pc if any
+  if (pc) { try { pc.close(); } catch {} }
+
+  pc = new RTCPeerConnection({ iceServers: [] });
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) socket.emit('ice-candidate', { roomId, candidate: e.candidate });
+  };
+
+  pc.onconnectionstatechange = async () => {
+    console.log('[Publisher] PC state:', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      setStatus('✅ Connected to receiver.', 'lightgreen');
+    } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      setStatus(`Connection ${pc.connectionState}. Trying to recover...`, 'orange');
+      if (!localStream) return;
+      await waitForOnline();
+      // Recreate + reoffer
+      await createPeerAndNegotiate();
+    }
+  };
+
+  // Add local tracks
+  if (localStream) {
+    for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+  }
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  socket.emit('offer', { roomId, sdp: offer });
+  setStatus('Offer sent. Waiting for answer...', 'deepskyblue');
+}
+
 socket.on('answer', async ({ sdp }) => {
+  if (!pc) return;
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    console.log('[Publisher] Answer set.');
-    setStatus('✅ Connected to receiver!', 'green');
-  } catch (err) {
-    console.error('[Publisher] Error setting remote description:', err);
-    setStatus(`❌ Error setting remote description: ${err?.message || err}`, 'red');
+    setStatus('✅ Answer set. Streaming...', 'lightgreen');
+  } catch (e) {
+    console.error('[Publisher] setRemoteDescription error:', e);
   }
 });
 
-// When the remote peer sends ICE candidates, add them to our connection.
 socket.on('ice-candidate', async ({ candidate }) => {
+  try { await pc?.addIceCandidate(new RTCIceCandidate(candidate)); }
+  catch (e) { console.error('[Publisher] addIceCandidate error:', e); }
+});
+
+// Server asks us to re-offer (e.g., a receiver joined/rejoined)
+socket.on('request-offer', async ({ roomId: r }) => {
+  if (!started || !localStream) return;
+  if (r && r !== roomId) return;
+  if (pendingNegotiate) return;
+  pendingNegotiate = true;
   try {
-    await pc.addIceCandidate(new RTCIceCandidate(candidate));
-  } catch (err) {
-    console.error('[Publisher] Error adding remote ICE candidate:', err);
+    await waitForOnline();
+    await createPeerAndNegotiate();
+  } finally {
+    pendingNegotiate = false;
   }
 });
 
-// Optional: show connectivity state changes for quick debugging.
-pc.onconnectionstatechange = () => {
-  console.log('[Publisher] PC state:', pc.connectionState);
-  if (pc.connectionState === 'connected') {
-    setStatus('✅ Peer connection established.', 'green');
-  } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-    setStatus(`⚠️ Connection state: ${pc.connectionState}`, 'orange');
-  }
-};
-
-// Optional: indicate signaling socket status
-socket.on('connect', () => setStatus('Signaling connected. Ready.', 'blue'));
+// Socket lifecycle
+socket.on('connect', () => {
+  setStatus('Signaling connected.', 'deepskyblue');
+  if (started) socket.emit('join', roomId, 'publisher');
+});
 socket.on('disconnect', () => setStatus('Signaling disconnected.', 'orange'));
